@@ -35,6 +35,21 @@ func NewListCommand(base *BaseDeps) *cobra.Command {
 			hideDuplicates, _ := cmd.Flags().GetBool("hide-duplicates")
 			panes, _ := cmd.Flags().GetBool("panes")
 			blacklisted, _ := cmd.Flags().GetBool("blacklisted")
+			listFormat, _ := cmd.Flags().GetString("format")
+			formatChanged := cmd.Flags().Changed("format")
+			iconExcludes, _ := cmd.Flags().GetStringSlice("icons-exclude")
+
+			renderFormat := listFormat
+			if formatChanged {
+				renderFormat, err = renderListFormatColors(listFormat, noColor)
+				if err != nil {
+					return err
+				}
+			}
+
+			if jsonOutput && formatChanged {
+				return errors.New("--format cannot be used with --json")
+			}
 
 			if panes && !deps.Tmux.IsAttached() {
 				return errors.New("--panes requires being inside a tmux session")
@@ -66,14 +81,30 @@ func NewListCommand(base *BaseDeps) *cobra.Command {
 				return nil
 			}
 
+			var activeWindowNames map[string]string
+			if formatChanged && listFormatUsesActiveWindowName(renderFormat) && hasTmuxSessions(sessions) {
+				windowNames, err := deps.Tmux.ListAllWindowNames(activeWindowNameFormat)
+				if err == nil {
+					activeWindowNames = firstActiveWindowNameBySession(windowNames)
+				}
+			}
+
 			for _, i := range sessions.OrderedIndex {
-				name := sessions.Directory[i].Name
-				if icons {
+				session := sessions.Directory[i]
+				name := session.Name
+				if icons && !sourceIconExcluded(iconExcludes, session.Src) {
 					if noColor {
-						name = deps.Icon.AddIconNoColor(sessions.Directory[i])
+						name = deps.Icon.AddIconNoColor(session)
 					} else {
-						name = deps.Icon.AddIcon(sessions.Directory[i])
+						name = deps.Icon.AddIcon(session)
 					}
+				}
+				if formatChanged {
+					activeWindowName := ""
+					if session.Src == "tmux" {
+						activeWindowName = activeWindowNames[session.Name]
+					}
+					name = formatListSession(renderFormat, session, name, activeWindowName)
 				}
 				fmt.Println(name)
 			}
@@ -93,6 +124,8 @@ func NewListCommand(base *BaseDeps) *cobra.Command {
 	cmd.Flags().BoolP("hide-duplicates", "d", false, "hide duplicate entries")
 	cmd.Flags().BoolP("panes", "p", false, "show panes in current session")
 	cmd.Flags().BoolP("blacklisted", "b", false, "show blacklisted sessions")
+	cmd.Flags().String("format", "", "format each session row ({name}, {session}, {source}, {path}, {active_window_name}, {active_window_name_prefix}; colors: {fg:yellow}...{/fg})")
+	cmd.Flags().StringSlice("icons-exclude", nil, "don't show source icons for these session sources (for example: tmux)")
 
 	return cmd
 }
