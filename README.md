@@ -386,7 +386,7 @@ Watch mode polls only active tmux sessions; directory and configured-session pre
 | `{active_window_name}` | The active tmux window name; empty for non-tmux sessions |
 | `{active_window_name_prefix}` | The active window name followed by a space, or empty when there is none |
 
-For example, if another tmux plugin names the active window with an application icon:
+For example, used in combination with tmux plugin [tmux-nerd-font-window-name](https://github.com/joshmedeski/tmux-nerd-font-window-name)
 
 ```sh
 sesh list --icons --format '{active_window_name_prefix}{name}'
