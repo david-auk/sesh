@@ -38,6 +38,16 @@ type filteredItem struct {
 	chipMatchLen int
 }
 
+// displayRow is one line of the rendered list: either a session, or the rule
+// drawn where one sort_order group ends and the next begins. A separator exists
+// only here — the cursor indexes filtered, never rows, so it can neither land
+// on one nor select one.
+type displayRow struct {
+	// index is the position in filtered, or -1 for a separator.
+	index     int
+	separator bool
+}
+
 // FetchFunc loads sessions asynchronously. It is called in a goroutine by Init().
 type FetchFunc func() (model.SeshSessions, error)
 
@@ -136,14 +146,29 @@ type Options struct {
 	PreviewBorder string
 	// PreviewFunc renders previews. Nil disables the pane entirely.
 	PreviewFunc PreviewFunc
+	// GroupSeparator draws a faint rule between sort_order groups. It is
+	// suppressed while the list is filtered, where the groups no longer occupy
+	// contiguous ranges.
+	GroupSeparator bool
+	// Remove drops an entry from the frecency backend. Nil leaves ctrl+x
+	// inert.
+	Remove RemoveFunc
 }
 
 type Model struct {
-	allItems       sessionItems
-	filtered       []filteredItem
-	filterInput    textinput.Model
-	cursor         int
-	offset         int
+	allItems    sessionItems
+	filtered    []filteredItem
+	filterInput textinput.Model
+	// cursor indexes filtered; offset indexes rows, which is the same list with
+	// the group separators laid in, so scrolling counts the lines actually
+	// drawn.
+	cursor int
+	offset int
+	// rows is the rendered layout of filtered — see displayRow — and rowOf maps
+	// a filtered index back to the row that draws it.
+	rows           []displayRow
+	rowOf          []int
+	groupSeparator bool
 	width          int
 	height         int
 	chosen         string
@@ -171,6 +196,14 @@ type Model struct {
 	// aliasSeq increments on every filter change so a pending auto-connect
 	// tick can tell whether it is stale.
 	aliasSeq int
+
+	// removeFunc drops an entry from the frecency backend, and confirm is the
+	// dialog guarding it — non-nil only while it is open, so its presence is
+	// the mode. status is a one-line message under the filter input,
+	// cleared by the next keypress.
+	removeFunc RemoveFunc
+	confirm    *confirmState
+	status     string
 
 	previewFunc     PreviewFunc
 	previewOn       bool
@@ -262,38 +295,57 @@ const (
 // is always the terminal's background color on its foreground color, which
 // stays legible under any color scheme. The half circles are left unstyled for
 // the same reason: their default foreground is exactly the color the reversed
-// label fills with, so the chip reads as one shape.
+// label fills with, so the chip reads as one shape — and so coloring one paints
+// the same block the reversed label does.
 func (m Model) aliasChip(name string, matchLen int) string {
 	alias, ok := m.aliasByName[name]
 	if !ok {
 		return ""
 	}
 
+	runes := []rune(alias)
+	matchLen = max(min(matchLen, len(runes)), 0)
+
 	label := lipgloss.NewStyle().Reverse(true)
-	text := highlightChipPrefix(alias, matchLen, label)
+	var text string
+	if matchLen > 0 {
+		text = label.Foreground(aliasMatchColor).Render(string(runes[:matchLen]))
+	}
+	if matchLen < len(runes) {
+		text += label.Render(string(runes[matchLen:]))
+	}
+
+	leftCap, rightCap := chipLeftGlyph, chipRightGlyph
+	capStyle := lipgloss.NewStyle()
 	if !m.showIcons {
 		// Without nerd fonts the half circles render as tofu, so fall back to
-		// brackets that still read as a chip.
-		return label.Render("[") + text + label.Render("]") + " "
+		// brackets that still read as a chip. They are part of the label rather
+		// than a glyph beside it, so they are reversed along with it.
+		leftCap, rightCap = "[", "]"
+		capStyle = label
 	}
-	return chipLeftGlyph + text + chipRightGlyph + " "
+	// The caps belong to the match block whenever the letters beside them do:
+	// the left one as soon as anything matches, the right one only once the
+	// whole alias has, so a full match reads as one unbroken chip.
+	return chipCap(capStyle, leftCap, matchLen > 0) +
+		text +
+		chipCap(capStyle, rightCap, matchLen > 0 && matchLen == len(runes)) + " "
 }
 
-// highlightChipPrefix styles the first matchLen runes of a chip label as
-// matched. Reverse video is kept throughout so the chip stays one shape;
-// setting a foreground under it paints the matched runes as a colored block,
-// which is the same red used to highlight matches in session names.
-func highlightChipPrefix(alias string, matchLen int, label lipgloss.Style) string {
-	runes := []rune(alias)
-	if matchLen <= 0 {
-		return label.Render(alias)
+// chipCap renders one end of the chip, painted into the match block when
+// matched so the highlight carries into the rounded end instead of stopping
+// short at the first or last letter.
+func chipCap(capStyle lipgloss.Style, glyph string, matched bool) string {
+	if matched {
+		return capStyle.Foreground(aliasMatchColor).Render(glyph)
 	}
-	if matchLen > len(runes) {
-		matchLen = len(runes)
-	}
-	matched := label.Foreground(lipgloss.ANSIColor(1)).Render(string(runes[:matchLen]))
-	return matched + label.Render(string(runes[matchLen:]))
+	return capStyle.Render(glyph)
 }
+
+// aliasMatchColor is the color matched alias runes are painted in. It is the
+// same green the matches in session names are drawn in, and under the chip's
+// reverse video it fills as a block of background rather than colored text.
+var aliasMatchColor = lipgloss.ANSIColor(2)
 
 // indexFilterPrefix is the sigil that, typed first, enters index mode: the rows
 // are numbered and the next digit jumps straight to one of them.
@@ -359,11 +411,13 @@ func New(fetchFunc FetchFunc, opts Options) Model {
 		aliasFilterPrefix:       opts.AliasFilterPrefix,
 		aliasAutoConnectDelay:   opts.AliasAutoConnectDelay,
 		disableAliasAutoConnect: opts.DisableAliasAutoConnect,
+		removeFunc:              opts.Remove,
 		previewFunc:             opts.PreviewFunc,
 		previewOn:               opts.Preview,
 		previewWidthPct:         previewWidth(opts.PreviewWidth),
 		previewMinWidth:         previewMinWidth(opts.PreviewMinWidth),
 		previewBorderName:       previewBorder(opts.PreviewBorder),
+		groupSeparator:          opts.GroupSeparator,
 	}
 	m.focusCmd = m.filterInput.Focus()
 	return m
@@ -475,6 +529,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyFilter()
 		return m, m.schedulePreview()
 
+	case entryRemovedMsg:
+		if msg.err != nil {
+			// The row is still in the list, and saying nothing would read as a
+			// removal that worked.
+			m.status = removalFailed(msg.err)
+			return m, nil
+		}
+		m.dropItem(msg.name, msg.path)
+		return m, m.schedulePreview()
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -482,6 +546,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyPressMsg:
+		// The dialog owns every key while it is open, so nothing reaches the
+		// filter input behind it.
+		if m.confirm != nil {
+			return m.updateConfirm(msg)
+		}
+		// A status message answers the previous keypress, so the next one
+		// retires it.
+		m.status = ""
+
 		switch msg.String() {
 		case "enter":
 			if m.loading {
@@ -512,6 +585,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+d":
 			m.cursorDown(m.visibleCount() / 2)
 			return m, m.schedulePreview()
+
+		case "ctrl+x":
+			return m.startRemove()
 
 		case "ctrl+o":
 			// Toggling stays allowed on a narrow terminal: the pane is gated on
@@ -748,18 +824,41 @@ func (m Model) indexJump(key string) (string, bool) {
 }
 
 func (m *Model) applyFilter() {
-	raw := m.filterInput.Value()
+	m.filtered = m.filterFor(m.filterInput.Value())
+	m.buildRows()
+}
+
+// filterFor narrows the loaded list for the raw input, dispatching on the sigil
+// it was typed with.
+func (m *Model) filterFor(raw string) []filteredItem {
 	if query, ok := m.aliasFilterQuery(raw); ok {
-		m.filtered = m.filterAliases(query)
-		return
+		return m.filterAliases(query)
 	}
 	// Index mode numbers whatever is displayed, so anything typed after the
 	// sigil filters exactly as it would on its own.
 	if query, ok := m.indexFilterQuery(raw); ok {
-		m.filtered = m.filterSessions(query)
-		return
+		return m.filterSessions(query)
 	}
-	m.filtered = m.filterSessions(raw)
+	return m.filterSessions(raw)
+}
+
+// buildRows lays the filtered sessions out as the lines the list renders,
+// inserting a rule wherever the sort_order group changes.
+//
+// Separators are suppressed as soon as anything is typed: a query reorders the
+// results by match quality, so the groups stop being contiguous ranges and a
+// rule would be drawing a boundary that isn't there.
+func (m *Model) buildRows() {
+	m.rows = make([]displayRow, 0, len(m.filtered))
+	m.rowOf = make([]int, len(m.filtered))
+	separate := m.groupSeparator && m.filterInput.Value() == ""
+	for i, item := range m.filtered {
+		if separate && i > 0 && item.item.session.Group != m.filtered[i-1].item.session.Group {
+			m.rows = append(m.rows, displayRow{index: -1, separator: true})
+		}
+		m.rowOf[i] = len(m.rows)
+		m.rows = append(m.rows, displayRow{index: i})
+	}
 }
 
 // filterSessions narrows the loaded list by pattern: everything when it's
@@ -775,9 +874,12 @@ func (m *Model) filterSessions(pattern string) []filteredItem {
 	}
 
 	if item, ok := m.aliasMatch(pattern); ok {
-		return []filteredItem{{item: item}}
+		return []filteredItem{{item: item, chipMatchLen: m.chipMatchLen(item.name, pattern)}}
 	}
 
+	// The chip is matched against what was typed, not the normalized form, for
+	// the same reason aliasMatch is: an alias is matched literally.
+	typed := pattern
 	if m.separatorAware {
 		pattern = normalizeSeparators(pattern)
 	}
@@ -785,12 +887,30 @@ func (m *Model) filterSessions(pattern string) []filteredItem {
 	matches := rankMatches(fuzzy.FindFromNoSort(pattern, m.allItems))
 	filtered := make([]filteredItem, len(matches))
 	for i, match := range matches {
+		item := m.allItems[match.Index]
 		filtered[i] = filteredItem{
-			item:           m.allItems[match.Index],
+			item:           item,
 			matchedIndexes: match.MatchedIndexes,
+			chipMatchLen:   m.chipMatchLen(item.name, typed),
 		}
 	}
 	return filtered
+}
+
+// chipMatchLen reports how many leading runes of a session's alias the query
+// prefixes, which is how much of its chip is highlighted. Aliases are matched
+// as a prefix rather than fuzzily so the chip fills in deterministically as the
+// alias is typed — the same rule alias-filter mode narrows by, applied here so
+// the chip lights up while filtering normally too.
+func (m *Model) chipMatchLen(name, query string) int {
+	alias, ok := m.aliasByName[name]
+	if !ok || query == "" {
+		return 0
+	}
+	if !strings.HasPrefix(strings.ToLower(alias), strings.ToLower(query)) {
+		return 0
+	}
+	return len([]rune(query))
 }
 
 // maxUnmatchedCharPenalty caps how much a name can be docked for the characters
@@ -835,9 +955,7 @@ func (m *Model) cursorUp(n int) {
 	if m.cursor < 0 {
 		m.cursor = 0
 	}
-	if m.cursor < m.offset {
-		m.offset = m.cursor
-	}
+	m.scrollToCursor()
 }
 
 func (m *Model) cursorDown(n int) {
@@ -849,9 +967,23 @@ func (m *Model) cursorDown(n int) {
 	if m.cursor > max {
 		m.cursor = max
 	}
-	visible := m.visibleCount()
-	if m.cursor >= m.offset+visible {
-		m.offset = m.cursor - visible + 1
+	m.scrollToCursor()
+}
+
+// scrollToCursor moves the viewport the least it can to keep the highlighted
+// session on screen. It works in row space so the separators between it and the
+// cursor are counted as the lines they are.
+func (m *Model) scrollToCursor() {
+	if m.cursor < 0 || m.cursor >= len(m.rowOf) {
+		m.offset = 0
+		return
+	}
+	row := m.rowOf[m.cursor]
+	if row < m.offset {
+		m.offset = row
+	}
+	if visible := m.visibleCount(); row >= m.offset+visible {
+		m.offset = row - visible + 1
 	}
 }
 
@@ -950,7 +1082,13 @@ func (m Model) View() tea.View {
 
 	// Filter input
 	b.WriteString("  " + m.filterInput.View())
-	b.WriteString("\n\n")
+	b.WriteString("\n")
+	// The status shares the blank line under the filter, so showing one never
+	// moves the list.
+	if m.status != "" {
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.ANSIColor(3)).Render("  " + m.status))
+	}
+	b.WriteString("\n")
 
 	visible := m.visibleCount()
 
@@ -973,12 +1111,12 @@ func (m Model) View() tea.View {
 	} else {
 		// Session list
 		end := m.offset + visible
-		if end > len(m.filtered) {
-			end = len(m.filtered)
+		if end > len(m.rows) {
+			end = len(m.rows)
 		}
 
 		cursorStyle := lipgloss.NewStyle().Foreground(lipgloss.ANSIColor(2)).Bold(true)
-		matchStyle := lipgloss.NewStyle().Foreground(lipgloss.ANSIColor(1)).Bold(true)
+		matchStyle := lipgloss.NewStyle().Foreground(lipgloss.ANSIColor(2)).Bold(true)
 		normalStyle := lipgloss.NewStyle()
 		windowStyle := lipgloss.NewStyle().Foreground(lipgloss.ANSIColor(8)).Faint(true)
 		indexStyle := lipgloss.NewStyle().Foreground(lipgloss.ANSIColor(4))
@@ -987,7 +1125,13 @@ func (m Model) View() tea.View {
 		// list instead of counted.
 		_, indexMode := m.indexFilterQuery(m.filterInput.Value())
 
-		for i := m.offset; i < end; i++ {
+		for r := m.offset; r < end; r++ {
+			if m.rows[r].separator {
+				b.WriteString(m.separatorRule())
+				b.WriteString("\n")
+				continue
+			}
+			i := m.rows[r].index
 			item := m.filtered[i]
 			prefix := "  "
 			if i == m.cursor {
@@ -1036,11 +1180,26 @@ func (m Model) View() tea.View {
 		content = lipgloss.JoinHorizontal(lipgloss.Top, list, m.previewView(cols, visible))
 	}
 
+	if m.confirm != nil {
+		content = overlayCentered(content, m.confirmView(), m.width, m.height)
+	}
+
 	v := tea.NewView(content)
 	// Full window mode: the picker fills the terminal and hands the user's
 	// scrollback back untouched when it quits.
 	v.AltScreen = true
 	return v
+}
+
+// separatorRule draws the boundary between two sort_order groups: a faint rule
+// across the list column, so a glance says whether the row under the cursor is
+// a live tmux session or somewhere to go.
+func (m Model) separatorRule() string {
+	width := m.contentWidth() - 2
+	if width < 1 {
+		width = 1
+	}
+	return lipgloss.NewStyle().Faint(true).Render("  " + strings.Repeat("─", width))
 }
 
 // indexGutter renders the jump number for the row at position i, or blanks of

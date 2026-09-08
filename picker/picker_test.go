@@ -1005,6 +1005,72 @@ func TestAliasChip_HighlightsMatchedPrefix(t *testing.T) {
 		"a match longer than the alias is clamped rather than panicking")
 }
 
+func TestAliasChip_HighlightsCaps(t *testing.T) {
+	m := newAliasModel(func(o *Options) { o.ShowIcons = true })
+
+	// The caps join the match block so the highlight is one shape: the left one
+	// as soon as anything matches, the right one only on a full match.
+	assert.NotEqual(t, m.aliasChip("my-project", 0), m.aliasChip("my-project", 1),
+		"the left cap must be highlighted once the alias starts matching")
+	partial, full := m.aliasChip("my-project", 1), m.aliasChip("my-project", 2)
+	assert.Equal(t, strings.Count(full, chipRightGlyph), 1)
+	assert.NotEqual(t, styleOf(partial, chipRightGlyph), styleOf(full, chipRightGlyph),
+		"the right cap is only highlighted once the whole alias matches")
+	assert.Equal(t, styleOf(partial, chipLeftGlyph), styleOf(full, chipLeftGlyph),
+		"the left cap stays highlighted for a partial and a full match alike")
+
+	plain := newAliasModel()
+	assert.Equal(t, "[wp] ", ansi.Strip(plain.aliasChip("my-project", 2)),
+		"highlighting the brackets must not change the text of the chip")
+	assert.NotEqual(t, styleOf(plain.aliasChip("my-project", 0), "]"),
+		styleOf(plain.aliasChip("my-project", 2), "]"),
+		"the bracket fallback highlights its caps too")
+}
+
+// styleOf returns the escape sequence rendered immediately before glyph, which
+// is the styling applied to it.
+func styleOf(s, glyph string) string {
+	before, _, found := strings.Cut(s, glyph)
+	if !found {
+		return ""
+	}
+	start := strings.LastIndex(before, "\x1b[")
+	if start < 0 {
+		return ""
+	}
+	return before[start:]
+}
+
+func TestFilter_HighlightsChipInNormalMode(t *testing.T) {
+	m := newAliasModel()
+
+	// Typing normally, with no sigil, still fills in the chip of any session
+	// whose alias the query prefixes.
+	m.filterInput.SetValue("do")
+	m.applyFilter()
+	require.Len(t, m.filtered, 1)
+	assert.Equal(t, "dotfiles", m.filtered[0].item.name)
+	assert.Equal(t, 2, m.filtered[0].chipMatchLen, "the typed prefix of the alias is highlighted")
+
+	// An exactly typed alias resolves to its target and fills the whole chip.
+	m.filterInput.SetValue("dot")
+	m.applyFilter()
+	require.Len(t, m.filtered, 1)
+	assert.Equal(t, 3, m.filtered[0].chipMatchLen)
+
+	// Aliases are matched case-insensitively, like the filter itself.
+	m.filterInput.SetValue("DO")
+	m.applyFilter()
+	require.Len(t, m.filtered, 1)
+	assert.Equal(t, 2, m.filtered[0].chipMatchLen)
+
+	// A query that matches the name but not the alias leaves the chip plain.
+	m.filterInput.SetValue("files")
+	m.applyFilter()
+	require.Len(t, m.filtered, 1)
+	assert.Equal(t, 0, m.filtered[0].chipMatchLen, "only alias prefixes highlight the chip")
+}
+
 func TestView_AliasChip(t *testing.T) {
 	m := newAliasModel()
 	out := ansi.Strip(fmt.Sprintf("%v", m.View()))
@@ -2018,4 +2084,90 @@ func TestIndexGutter_RunsOutAfterNine(t *testing.T) {
 	assert.Equal(t, "9 ", indexGutter(maxIndexJump-1, style))
 	assert.Equal(t, "  ", indexGutter(maxIndexJump, style),
 		"rows past the ninth are unreachable, and blanks keep the names aligned")
+}
+
+// groupedSessions is testSessions with the sources split across two sort_order
+// groups: tmux pinned on top, everything else merged below it.
+func groupedSessions() model.SeshSessions {
+	sessions := testSessions()
+	sessions.OrderedIndex = []string{"s1", "s5", "s2", "s3", "s4"}
+	for key, group := range map[string]int{"s1": 0, "s5": 0, "s2": 1, "s3": 1, "s4": 1} {
+		session := sessions.Directory[key]
+		session.Group = group
+		sessions.Directory[key] = session
+	}
+	return sessions
+}
+
+func newGroupedTestModel(separator bool) Model {
+	sessions := groupedSessions()
+	m := New(testFetchFunc(sessions), testOptionsWith(func(o *Options) {
+		o.GroupSeparator = separator
+	}))
+	result, _ := m.Update(sessionsLoadedMsg{sessions: sessions})
+	m = result.(Model)
+	m.width = 60
+	m.height = 24
+	return m
+}
+
+func TestGroupSeparator_DrawnBetweenGroups(t *testing.T) {
+	m := newGroupedTestModel(true)
+
+	require.Len(t, m.rows, 6, "one rule laid in between the two groups")
+	assert.True(t, m.rows[2].separator)
+	assert.Equal(t, []int{0, 1, 3, 4, 5}, m.rowOf)
+
+	lines := strings.Split(ansi.Strip(m.View().Content), "\n")
+	assert.Contains(t, lines[3], "notes")
+	assert.Contains(t, lines[4], "─")
+	assert.Contains(t, lines[5], "dotfiles")
+}
+
+func TestGroupSeparator_OffByDefault(t *testing.T) {
+	m := newGroupedTestModel(false)
+
+	assert.Len(t, m.rows, 5)
+	assert.NotContains(t, ansi.Strip(m.View().Content), "─")
+}
+
+func TestGroupSeparator_SuppressedWhileFiltering(t *testing.T) {
+	m := newGroupedTestModel(true)
+
+	m.filterInput.SetValue("o")
+	m.applyFilter()
+
+	for _, row := range m.rows {
+		assert.False(t, row.separator, "no rule while the list is reordered by match quality")
+	}
+	assert.NotContains(t, ansi.Strip(m.View().Content), "─")
+}
+
+func TestGroupSeparator_CursorSkipsIt(t *testing.T) {
+	m := newGroupedTestModel(true)
+
+	// The cursor indexes sessions, so stepping over the boundary lands on the
+	// first session of the next group rather than on the rule.
+	m.cursor = 1
+	m.cursorDown(1)
+	assert.Equal(t, 2, m.cursor)
+	assert.Equal(t, "dotfiles", m.filtered[m.cursor].item.name)
+
+	m.cursorUp(1)
+	assert.Equal(t, 1, m.cursor)
+	assert.Equal(t, "notes", m.filtered[m.cursor].item.name)
+}
+
+func TestGroupSeparator_ScrollCountsTheRule(t *testing.T) {
+	m := newGroupedTestModel(true)
+	// Three visible lines: filter row, blank, and one session row short of the
+	// list, so the rule has to be paid for out of the same budget.
+	m.height = headerLines + 3
+
+	m.cursorDown(4)
+	assert.Equal(t, 4, m.cursor)
+	assert.Equal(t, 3, m.offset, "the rule occupies a line the viewport must scroll past")
+
+	lines := strings.Split(ansi.Strip(m.View().Content), "\n")
+	assert.Contains(t, lines[len(lines)-1], "rails-app")
 }

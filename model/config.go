@@ -45,7 +45,7 @@ type (
 		DefaultSessionConfig    DefaultSessionConfig `toml:"default_session"`
 		Blacklist               []string             `toml:"blacklist"`
 		SessionConfigs          []SessionConfig      `toml:"session"`
-		SortOrder               []string             `toml:"sort_order"`
+		SortOrder               SortOrder            `toml:"sort_order"`
 		WindowConfigs           []WindowConfig       `toml:"window"`
 		WildcardConfigs         []WildcardConfig     `toml:"wildcard"`
 		WorktreeConfigs         []WorktreeConfig     `toml:"worktree"`
@@ -64,6 +64,19 @@ type (
 		StrictMode bool `toml:"strict_mode"`
 	}
 
+	// SortOrder is `sort_order` as TOML hands it over: a list whose entries are
+	// either a source name or a nested list of source names. The nested form
+	// declares one merged group, whose sessions are ordered by zoxide score
+	// instead of source by source. A flat list is every source on its own,
+	// which is how the list has always been built.
+	//
+	// It is []any because the array is heterogeneous; SortGroups normalizes it.
+	SortOrder []any
+
+	// SortGroup is one block of the session list: a single source, or several
+	// sources merged and score-ordered.
+	SortGroup []string
+
 	// FrecencyConfig overrides the commands used to drive the frecency
 	// directory-jumping backend (zoxide by default). Each command may be
 	// swapped for an alternative tool such as fasd, autojump, or memy.
@@ -80,6 +93,9 @@ type (
 		// AddCommand records a path to bump its frecency after connecting.
 		// The `{}` placeholder is replaced with the path.
 		AddCommand string `toml:"add_command"`
+		// RemoveCommand drops a path from the backend, used by the picker's
+		// ctrl+x binding. The `{}` placeholder is replaced with the path.
+		RemoveCommand string `toml:"remove_command"`
 	}
 
 	// NameSubstitution rewrites the path a session name is derived from before
@@ -171,6 +187,12 @@ type (
 		// pane: "line" (default), "thick", "double", or "none" for no divider.
 		// Empty means unset.
 		PreviewBorder string `toml:"preview_border"`
+		// GroupSeparator draws a faint rule between the sort_order groups in
+		// the picker, so the boundary between live tmux sessions and everywhere
+		// else is visible once a merged group interleaves the sources. Opt-in:
+		// with a flat sort_order every source is its own group, and a rule
+		// between each of them is more lines than most lists want.
+		GroupSeparator bool `toml:"group_separator"`
 	}
 
 	WildcardConfig struct {
@@ -206,3 +228,31 @@ type (
 		URLCommand  string `toml:"url_command"` // AppleScript fragment; default "URL of active tab of front window"
 	}
 )
+
+// SortGroups normalizes the raw sort_order into the groups the list is built
+// from. Entries that are neither a source name nor a list of them are dropped:
+// a malformed sort_order costs the ordering it asked for, never the sessions.
+func (s SortOrder) SortGroups() []SortGroup {
+	groups := make([]SortGroup, 0, len(s))
+	for _, entry := range s {
+		switch v := entry.(type) {
+		case string:
+			groups = append(groups, SortGroup{v})
+		case []string:
+			if len(v) > 0 {
+				groups = append(groups, SortGroup(v))
+			}
+		case []any:
+			group := make(SortGroup, 0, len(v))
+			for _, name := range v {
+				if src, ok := name.(string); ok {
+					group = append(group, src)
+				}
+			}
+			if len(group) > 0 {
+				groups = append(groups, group)
+			}
+		}
+	}
+	return groups
+}

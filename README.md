@@ -678,12 +678,13 @@ Sesh uses [zoxide](https://github.com/ajeetdsouza/zoxide) as its default frecenc
 list_command  = "fasd -d -l -R"  # list all tracked entries
 query_command = "fasd -d {}"     # resolve one input to a path
 add_command   = "fasd -A {}"     # record a path after connecting
+remove_command = "fasd -D {}"    # remove a path (picker ctrl+x)
 ```
 
-- The `{}` placeholder is replaced with the query string (`query_command`) or the path (`add_command`), the same substitution used by `preview_command`.
+- The `{}` placeholder is replaced with the query string (`query_command`) or the path (`add_command`, `remove_command`), the same substitution used by `preview_command`.
 - `list_command` output is parsed one path per line, most-frecent first. A leading numeric score is detected automatically when present (as with zoxide's `--score`); otherwise the score is `0`.
 - Any command runs as a single binary (no shell), so pipes/redirects aren't supported.
-- Any field you omit falls back to its zoxide default (`zoxide query --list --score`, `zoxide query {}`, `zoxide add {}`), so an absent `[frecency]` table leaves behavior unchanged.
+- Any field you omit falls back to its zoxide default (`zoxide query --list --score`, `zoxide query {}`, `zoxide add {}`, `zoxide remove {}`), so an absent `[frecency]` table leaves behavior unchanged.
 - The source label in `sesh list` output stays `zoxide`, so existing integrations that read the `--json` output keep working.
 
 ### Schema (Editor Autocomplete)
@@ -803,6 +804,43 @@ sort_order = [
 ]
 ```
 
+#### Merging sources into one score-ordered group
+
+By default every source is its own block, so a config session you open daily
+still sits below zoxide paths you haven't touched in weeks. Nest sources in
+`sort_order` to merge them into a single block ordered by zoxide score, highest
+first:
+
+```toml
+sort_order = [
+  "tmux",                # live sessions stay pinned on top
+  ["config", "zoxide"],  # merged, ordered by zoxide score
+]
+```
+
+Sessions from a source that carries no score of its own — a `[[session]]` block,
+for instance — borrow the score zoxide has for their path, so they sort by how
+often that directory is actually visited. A path zoxide has never seen scores 0
+and trails the group.
+
+Groups still appear in the order they're listed, and a flat `sort_order` behaves
+exactly as it always has: merging is opt-in.
+
+#### Group separator
+
+Once sources are interleaved, the boundary between live tmux sessions and
+everywhere else stops being obvious from position alone. `group_separator` draws
+a faint rule between the `sort_order` groups in the picker:
+
+```toml
+[tui]
+group_separator = true
+```
+
+The rule is never selectable and the cursor steps straight over it. It is
+suppressed while you're filtering, where results are reordered by match quality
+and the groups no longer line up with contiguous ranges.
+
 ### Cache
 
 > [!WARNING]
@@ -843,6 +881,7 @@ prompt = "> "
 placeholder = "Filter sessions... "
 show_icons = false
 show_windows = false
+group_separator = false
 window_name_format = "#{window_name}"
 alias_auto_connect_delay = "150ms"
 alias_filter_prefix = "/"
@@ -946,6 +985,28 @@ Pressing <kbd>3</kbd> connects to `my-project` immediately. Only `1`–`9` jump,
 The numbers follow the visible list, so anything typed after the sigil narrows it first and renumbers what's left — `#a` then <kbd>2</kbd> jumps to the second match for `a`. A digit with no row at that position does nothing rather than filtering.
 
 Only a leading `#` counts, so `feat#123` filters normally. If you configure `alias_filter_prefix = "#"`, alias mode wins and this mode is unreachable.
+
+#### Removing a zoxide entry
+
+A directory you deleted or renamed keeps showing up in the picker until zoxide is told about it. <kbd>ctrl+x</kbd> on a zoxide row prunes it where you noticed it, behind a confirmation:
+
+```
+╭────────────────────────────────────────────────────────╮
+│                                                        │
+│    Do you want to remove this directory from zoxide?   │
+│                                                        │
+│                    ~/c/some-old-project                │
+│                                                        │
+│                      Yes      No                       │
+│                                                        │
+╰────────────────────────────────────────────────────────╯
+```
+
+<kbd>y</kbd> or <kbd>enter</kbd> removes it, <kbd>n</kbd>, <kbd>q</kbd>, or <kbd>esc</kbd> cancels, and <kbd>←</kbd>/<kbd>→</kbd> or <kbd>tab</kbd> move between the buttons. Nothing typed while the dialog is open reaches the filter, so the list is exactly as you left it either way.
+
+Only zoxide rows can be removed — a tmux session, a `[[session]]` block, or a tmuxinator config is not zoxide's to forget, so <kbd>ctrl+x</kbd> says so and does nothing. The row disappears only once the removal actually succeeded; a backend that refuses it reports the error and leaves the row in place.
+
+The removal runs `zoxide remove {}` by default, or whatever `remove_command` you set — see [Custom Frecency Backend](#custom-frecency-backend-fasd-autojump-etc). With `cache = true`, the cache is rewritten behind the removal so the next launch doesn't list the directory again.
 
 #### Preview pane
 
